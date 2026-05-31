@@ -30,6 +30,22 @@ import re
 import subprocess
 import sys
 
+# --- UTF-8 file I/O shim — fix for UnicodeDecodeError on non-UTF-8 OS locales (e.g. Windows cp1251) ---
+import builtins as _builtins
+_std_open = _builtins.open
+def open(*args, **kwargs):  # noqa: A001 — intentional builtins.open override (text mode only)
+    _mode = kwargs.get("mode", args[1] if len(args) > 1 else "r")
+    if "b" not in _mode:
+        kwargs.setdefault("encoding", "utf-8")
+    return _std_open(*args, **kwargs)
+
+# Ensure stdout/stderr can emit non-ASCII on cp1251 consoles.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 
 # ── Default rules ─────────────────────────────────────────────────────
 

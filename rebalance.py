@@ -24,6 +24,24 @@ import subprocess
 import sys
 import traceback
 
+# --- UTF-8 file I/O shim — fix for UnicodeDecodeError on non-UTF-8 OS locales (e.g. Windows cp1251) ---
+# open() without an explicit encoding uses the platform default codec and crashes on non-ASCII
+# memory content (Cyrillic, CJK, accents...). Shadow open() in this module to default to UTF-8.
+import builtins as _builtins
+_std_open = _builtins.open
+def open(*args, **kwargs):  # noqa: A001 — intentional builtins.open override (text mode only)
+    _mode = kwargs.get("mode", args[1] if len(args) > 1 else "r")
+    if "b" not in _mode:
+        kwargs.setdefault("encoding", "utf-8")
+    return _std_open(*args, **kwargs)
+
+# Ensure stdout/stderr can emit non-ASCII (→, —, box-drawing, memory content) on cp1251 consoles.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 VERSION = "0.7.31"
 REPO_OWNER = "j-p-c"
 REPO_NAME = "alzheimer"
@@ -2050,8 +2068,14 @@ def main():
         description="Rebalance Claude Code's hierarchical memory tree."
     )
     parser.add_argument(
-        "memory_dir",
-        help="Path to the memory directory containing MEMORY.md.",
+        "memory_dir", nargs="?", default=None,
+        help="Path to the memory directory containing MEMORY.md. "
+             "Optional with --all-projects, or --hook PostToolUse (reads stdin).",
+    )
+    parser.add_argument(
+        "--all-projects", action="store_true",
+        help="Run on every ~/.claude/projects/*/memory dir (Python glob; "
+             "cross-platform replacement for a bash for-loop in hooks).",
     )
     parser.add_argument(
         "--max-lines", type=int, default=None,
@@ -2101,6 +2125,34 @@ def main():
         version=f"alzheimer {VERSION}",
     )
     args = parser.parse_args()
+
+    # PostToolUse hook: the written file path arrives as JSON on stdin.
+    # Derive the memory dir from it (cross-platform; replaces a bash/jq pipeline).
+    if args.hook and args.hook_event == "PostToolUse" and not args.memory_dir:
+        try:
+            _payload = json.load(sys.stdin)
+        except Exception:
+            sys.exit(0)
+        _fp = ((_payload.get("tool_input") or {}).get("file_path")
+               or (_payload.get("tool_response") or {}).get("filePath") or "")
+        if "/memory/" not in _fp.replace("\\", "/"):
+            sys.exit(0)  # not a memory write — nothing to do
+        args.memory_dir = os.path.dirname(_fp)
+
+    # --all-projects: run once per project memory dir (Python glob; no bash needed).
+    if args.all_projects:
+        import glob
+        _base = os.path.expanduser(os.path.join("~", ".claude", "projects"))
+        _dirs = [d for d in glob.glob(os.path.join(_base, "*", "memory"))
+                 if os.path.isfile(os.path.join(d, "MEMORY.md"))]
+        _passthru = [a for a in sys.argv[1:] if a != "--all-projects"]
+        for _d in _dirs:
+            subprocess.run([sys.executable, os.path.abspath(__file__), _d, *_passthru])
+        sys.exit(0)
+
+    if not args.memory_dir:
+        parser.error("memory_dir is required (unless --all-projects, or "
+                     "--hook --hook-event PostToolUse reading stdin).")
 
     memory_dir = os.path.abspath(args.memory_dir)
 

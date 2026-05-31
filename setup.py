@@ -21,6 +21,23 @@ import os
 import re
 import sys
 
+# --- UTF-8 file I/O shim — fix for UnicodeDecodeError on non-UTF-8 OS locales (e.g. Windows cp1251) ---
+# Without this, seed_memory() crashes reading a non-ASCII MEMORY.md during --install.
+import builtins as _builtins
+_std_open = _builtins.open
+def open(*args, **kwargs):  # noqa: A001 — intentional builtins.open override (text mode only)
+    _mode = kwargs.get("mode", args[1] if len(args) > 1 else "r")
+    if "b" not in _mode:
+        kwargs.setdefault("encoding", "utf-8")
+    return _std_open(*args, **kwargs)
+
+# Ensure stdout/stderr can emit non-ASCII on cp1251 consoles.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 
 def get_rebalancer_path():
     """Return the absolute path to rebalance.py."""
@@ -42,22 +59,25 @@ def get_reminders_path():
 
 def generate_hooks(rebalancer_path, guardrails_path=None,
                     reminders_path=None):
-    """Generate the hook configuration dict."""
-    # Escape for JSON embedding in shell commands.
-    rp = rebalancer_path.replace('"', '\\"')
+    """Generate the hook configuration dict.
+
+    Cross-platform: no bash/jq (works under cmd/PowerShell too), and the
+    interpreter is the absolute ``sys.executable`` that ran setup — so hooks
+    don't depend on a ``python3`` being on PATH (on Windows it's often
+    ``python``/``py``/versioned). The bash glob + jq pipeline are replaced by
+    rebalance.py's own ``--all-projects`` flag and stdin parsing.
+    """
+    py = f'"{sys.executable}"'
+    rp = f'"{rebalancer_path}"'
 
     hooks = {
         "PostToolUse": [{
             "matcher": "Write|Edit",
             "hooks": [{
                 "type": "command",
-                "command": (
-                    f"jq -r '(.tool_input.file_path // "
-                    f".tool_response.filePath) // empty' | "
-                    f'{{ read -r f; echo "$f" | grep -q \'/memory/\' '
-                    f"&& python3 \"{rp}\" --hook --hook-event PostToolUse "
-                    f'"$(dirname "$f")" 2>&1 | head -5; }} || true'
-                ),
+                # rebalance.py reads the tool payload from stdin and self-filters
+                # to memory writes (see --hook --hook-event PostToolUse handling).
+                "command": f"{py} {rp} --hook --hook-event PostToolUse",
                 "timeout": 15,
                 "statusMessage": "Checking memory balance..."
             }]
@@ -65,11 +85,7 @@ def generate_hooks(rebalancer_path, guardrails_path=None,
         "SessionStart": [{
             "hooks": [{
                 "type": "command",
-                "command": (
-                    f'for d in ~/.claude/projects/*/memory; do '
-                    f'[ -f "$d/MEMORY.md" ] && '
-                    f'python3 "{rp}" --hook --hook-event SessionStart "$d" 2>&1; done || true'
-                ),
+                "command": f"{py} {rp} --all-projects --hook --hook-event SessionStart",
                 "timeout": 15,
                 "statusMessage": "Rebalancing memory tree..."
             }]
@@ -77,11 +93,7 @@ def generate_hooks(rebalancer_path, guardrails_path=None,
         "PreCompact": [{
             "hooks": [{
                 "type": "command",
-                "command": (
-                    f'for d in ~/.claude/projects/*/memory; do '
-                    f'[ -f "$d/MEMORY.md" ] && '
-                    f'python3 "{rp}" --hook --hook-event PreCompact "$d" 2>&1; done || true'
-                ),
+                "command": f"{py} {rp} --all-projects --hook --hook-event PreCompact",
                 "timeout": 15,
                 "statusMessage": "Rebalancing memory tree before compact..."
             }]
@@ -90,12 +102,12 @@ def generate_hooks(rebalancer_path, guardrails_path=None,
 
     # Add guardrails PreToolUse hook (hard layer).
     if guardrails_path:
-        gp = guardrails_path.replace('"', '\\"')
+        gp = f'"{guardrails_path}"'
         hooks["PreToolUse"] = [{
             "matcher": "Bash",
             "hooks": [{
                 "type": "command",
-                "command": f'python3 "{gp}"',
+                "command": f"{py} {gp}",
                 "timeout": 5,
                 "statusMessage": "Checking guardrails..."
             }]
@@ -103,11 +115,11 @@ def generate_hooks(rebalancer_path, guardrails_path=None,
 
     # Add reminders UserPromptSubmit hook (time-triggered checks).
     if reminders_path:
-        mp = reminders_path.replace('"', '\\"')
+        mp = f'"{reminders_path}"'
         hooks["UserPromptSubmit"] = [{
             "hooks": [{
                 "type": "command",
-                "command": f'python3 "{mp}"',
+                "command": f"{py} {mp}",
                 "timeout": 5,
                 "statusMessage": "Checking reminders..."
             }]
