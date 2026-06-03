@@ -73,16 +73,31 @@ EMERGENCY_OK_MARKER = "<!-- OK -->"
 # and post-compaction load carries the "read _index first" instruction.
 BOOTSTRAP_START = "<!-- alzheimer:bootstrap:start -->"
 BOOTSTRAP_END = "<!-- alzheimer:bootstrap:end -->"
-BOOTSTRAP_TEXT = [
-    BOOTSTRAP_START,
-    "**BOOTSTRAP (read first):**",
-    "Your FIRST action in a new session or after compaction: Glob",
-    "`**/_index/*.md` and Read every match in parallel. They are one-line",
-    "summaries of every memory file in their category — complete",
-    "orientation in ~5 files instead of reading hundreds. Skipping this",
-    "means inheriting a fog of ignorance. Subagents: ignore this block.",
-    BOOTSTRAP_END,
-]
+
+
+def bootstrap_text(memory_dir):
+    """Bootstrap directive for the MEMORY.md header, anchored to memory_dir.
+
+    The Glob/Read step MUST target the memory directory, not the project
+    working dir — Glob defaults to the project cwd, where there is no
+    `_index`, so an unanchored `Glob **/_index/*.md` returns nothing and the
+    reading agent wrongly concludes the index is missing. We bake the
+    absolute memory path into the directive so it can't be misresolved.
+    """
+    mem = os.path.abspath(memory_dir)
+    return [
+        BOOTSTRAP_START,
+        "**BOOTSTRAP (read first):**",
+        "Your FIRST action in a new session or after compaction: Glob",
+        f"`**/_index/*.md` with the Glob `path` set to `{mem}` (your memory",
+        "directory). Glob defaults to the project working dir, so if you omit",
+        "this path it returns nothing — do NOT conclude the index is missing;",
+        "pass the path. Then Read every match in parallel: they are one-line",
+        "summaries of every memory file in their category — complete",
+        "orientation in ~5 files instead of reading hundreds. Skipping this",
+        "means inheriting a fog of ignorance. Subagents: ignore this block.",
+        BOOTSTRAP_END,
+    ]
 
 # Config file name (placed in memory directory to override defaults).
 CONFIG_FILE = ".alzheimer.conf"
@@ -513,6 +528,8 @@ def ensure_memory_bootstrap(header, memory_dir):
     if not os.path.isdir(os.path.join(memory_dir, INDEX_DIR)):
         return header  # No _index tree; directive would point at nothing.
 
+    block = bootstrap_text(memory_dir)
+
     # If an existing block is present, check whether it's current.
     start_idx = end_idx = None
     for i, line in enumerate(header):
@@ -523,7 +540,7 @@ def ensure_memory_bootstrap(header, memory_dir):
             break
 
     if start_idx is not None and end_idx is not None:
-        if header[start_idx:end_idx + 1] == BOOTSTRAP_TEXT:
+        if header[start_idx:end_idx + 1] == block:
             return header  # Already current.
         del header[start_idx:end_idx + 1]
         if start_idx < len(header) and header[start_idx].strip() == "":
@@ -541,7 +558,7 @@ def ensure_memory_bootstrap(header, memory_dir):
     if insert_at < len(header) and header[insert_at].strip() == "":
         insert_at += 1  # Land below the title's blank separator.
 
-    header[insert_at:insert_at] = BOOTSTRAP_TEXT + [""]
+    header[insert_at:insert_at] = block + [""]
     return header
 
 

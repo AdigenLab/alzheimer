@@ -10,6 +10,8 @@ import unittest
 
 from rebalance import (
     Anomaly,
+    BOOTSTRAP_END,
+    BOOTSTRAP_START,
     CONFIG_FILE,
     DEFAULT_MAX_LINES,
     DEFAULT_MAX_BYTES,
@@ -27,11 +29,13 @@ from rebalance import (
     _write_update_cache,
     build_glossary_entry,
     build_guardrails_entry,
+    bootstrap_text,
     check_drift,
     check_for_updates,
     collect_anomalies,
     collect_memory_files,
     count_inline_content,
+    ensure_memory_bootstrap,
     extract_keywords,
     file_size_bytes,
     find_orphans,
@@ -2483,6 +2487,73 @@ class TestRemindersEscalation(unittest.TestCase):
         _write_fire_count(5)
         _reset_fire_count()
         self.assertEqual(_read_fire_count(), 0)
+
+
+class TestBootstrapDirective(unittest.TestCase):
+    """Regression tests for the MEMORY.md bootstrap directive.
+
+    The directive must anchor the Glob to the memory directory. Glob
+    defaults to the project working dir (which has no _index), so an
+    unanchored pattern returns nothing and the reading agent wrongly
+    concludes the index is missing. Pure in-memory tests: they never
+    write/read non-ASCII files, so they are independent of the test
+    helpers' file-encoding handling.
+    """
+
+    @staticmethod
+    def _with_index(d):
+        os.makedirs(os.path.join(d, "_index"))
+
+    def test_directive_bakes_in_absolute_path(self):
+        with TestDir() as d:
+            text = "\n".join(bootstrap_text(d))
+            self.assertIn(os.path.abspath(d), text)
+            self.assertIn("`path`", text)
+
+    def test_directive_uses_leading_recursive_pattern(self):
+        # Only a leading **/ makes Claude Code's Glob match files directly
+        # under _index/ when a search path is given; a bare _index/*.md or
+        # _index/**/*.md finds nothing.
+        self.assertIn("**/_index/*.md", "\n".join(bootstrap_text("/some/mem")))
+
+    def test_inject_into_empty_header(self):
+        with TestDir() as d:
+            self._with_index(d)
+            out = ensure_memory_bootstrap(["# Memory Index", ""], d)
+            self.assertEqual(out[:2], ["# Memory Index", ""])
+            self.assertIn(BOOTSTRAP_START, out)
+            self.assertIn(BOOTSTRAP_END, out)
+            self.assertIn(os.path.abspath(d), "\n".join(out))
+
+    def test_idempotent(self):
+        with TestDir() as d:
+            self._with_index(d)
+            once = ensure_memory_bootstrap(["# Memory Index", ""], d)
+            twice = ensure_memory_bootstrap(list(once), d)
+            self.assertEqual(once, twice)
+
+    def test_replaces_stale_unanchored_block(self):
+        with TestDir() as d:
+            self._with_index(d)
+            header = [
+                "# Memory Index", "",
+                BOOTSTRAP_START,
+                "Glob `**/_index/*.md` and Read every match.",
+                BOOTSTRAP_END, "",
+            ]
+            joined = "\n".join(ensure_memory_bootstrap(header, d))
+            # Old unanchored body replaced; new body carries the path.
+            self.assertNotIn("and Read every match.", joined)
+            self.assertIn(os.path.abspath(d), joined)
+            # Exactly one marker pair remains (no duplication).
+            self.assertEqual(joined.count(BOOTSTRAP_START), 1)
+            self.assertEqual(joined.count(BOOTSTRAP_END), 1)
+
+    def test_skips_when_no_index_dir(self):
+        with TestDir() as d:
+            # No _index/ → directive would point at nothing; header untouched.
+            header = ["# Memory Index", ""]
+            self.assertEqual(ensure_memory_bootstrap(list(header), d), header)
 
 
 if __name__ == "__main__":
