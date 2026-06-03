@@ -66,6 +66,7 @@ from rebalance import (
     is_category_entry,
     is_sub_index_pointer,
     load_config,
+    migrate_separators,
     parse_glossary,
     parse_guardrails,
     parse_index,
@@ -2753,6 +2754,57 @@ class TestCrossPlatformHardening(unittest.TestCase):
             f'"{sys.executable}" "{helper}"', rule)
         self.assertEqual(rc, 0)
         self.assertIn("П", stdout)
+
+    # ── migrate_separators: heal pre-fix Windows backslash pointers ──
+
+    def test_migrate_separators_heals_backslash_pointers(self):
+        """A non-flat tree written by a pre-fix Windows run (backslash
+        pointers) is healed to POSIX in place — link targets only — while the
+        bootstrap block, descriptions and non-link backslashes are preserved;
+        idempotent on a second run."""
+        with TestDir() as d:
+            os.makedirs(os.path.join(d, "_index"))
+            with open(os.path.join(d, "MEMORY.md"), "w") as f:
+                f.write(
+                    "# Memory\n\n"
+                    f"{BOOTSTRAP_START}\n"
+                    # Non-link line containing a backslash — must be preserved.
+                    "Read _index\\reference.md first.\n"
+                    f"{BOOTSTRAP_END}\n\n"
+                    "- [Feedback (3)](_index\\feedback.md) — grouped feedback\n"
+                    "- [Note](note.md) — a flat leaf\n")
+            with open(os.path.join(d, "_index", "feedback.md"), "w") as f:
+                f.write(
+                    "# Feedback\n\n"
+                    "- [Broken (2)](feedback\\broken.md) — a sub-index\n"
+                    "- [Up](..\\note.md) — leaf pointing to the parent\n")
+
+            migrated = migrate_separators(d)
+            self.assertEqual(set(migrated),
+                             {"MEMORY.md", "_index/feedback.md"})
+
+            with open(os.path.join(d, "MEMORY.md")) as f:
+                mem = f.read()
+            with open(os.path.join(d, "_index", "feedback.md")) as f:
+                fb = f.read()
+
+            # Link targets normalized to POSIX.
+            self.assertIn("](_index/feedback.md)", mem)
+            self.assertNotIn("](_index\\feedback.md)", mem)
+            self.assertIn("](feedback/broken.md)", fb)
+            self.assertIn("](../note.md)", fb)
+            self.assertNotIn("\\broken.md", fb)
+            self.assertNotIn("\\note.md", fb)
+
+            # Bootstrap block + non-link backslash + descriptions preserved.
+            self.assertIn(BOOTSTRAP_START, mem)
+            self.assertIn(BOOTSTRAP_END, mem)
+            self.assertIn("Read _index\\reference.md first.", mem)
+            self.assertIn("— grouped feedback", mem)
+            self.assertIn("](note.md)", mem)  # already-POSIX leaf untouched
+
+            # Idempotent: nothing left to migrate.
+            self.assertEqual(migrate_separators(d), [])
 
 
 if __name__ == "__main__":

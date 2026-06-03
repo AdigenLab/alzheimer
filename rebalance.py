@@ -451,6 +451,59 @@ def write_index(filepath, header, entries):
         f.write("\n".join(lines))
 
 
+def _iter_index_files(memory_dir):
+    """Yield MEMORY.md and every _index/**/*.md path under memory_dir."""
+    memory_md = os.path.join(memory_dir, "MEMORY.md")
+    if os.path.isfile(memory_md):
+        yield memory_md
+    for root, _dirs, files in os.walk(os.path.join(memory_dir, INDEX_DIR)):
+        for fname in sorted(files):
+            if fname.endswith(".md"):
+                yield os.path.join(root, fname)
+
+
+def migrate_separators(memory_dir):
+    """Heal logical pointers written with Windows backslashes into POSIX.
+
+    A pre-fix Windows run could persist index links like ``_index\\user.md``
+    or ``..\\foo.md`` (os.sep leaked into a stored logical path). New code
+    always writes POSIX, but those already-on-disk pointers were never healed
+    and would be mis-followed (a backslash in a Markdown link resolves only by
+    accident) and mis-classified on read.
+
+    This rewrites ONLY the link target inside each entry's ``](...)`` to
+    forward slashes, in place. Every other byte — the bootstrap block,
+    comments, blank lines, descriptions, and any non-link backslash — is
+    preserved. Idempotent and a no-op on POSIX-clean trees. Returns the list
+    of migrated paths (relative to memory_dir, POSIX form).
+    """
+    migrated = []
+    for path in _iter_index_files(memory_dir):
+        try:
+            with open(path) as f:
+                text = f.read()
+        except OSError:
+            continue
+        if "\\" not in text:
+            continue  # fast path: no backslashes anywhere in the file
+        out_lines = []
+        changed = False
+        for line in text.split("\n"):
+            m = ENTRY_RE.match(line)
+            if m and "\\" in m.group("path"):
+                orig = m.group("path")
+                norm = orig.replace("\\", "/")
+                line = line.replace(f"]({orig})", f"]({norm})", 1)
+                changed = True
+            out_lines.append(line)
+        if changed:
+            with open(path, "w") as f:
+                f.write("\n".join(out_lines))
+            migrated.append(
+                os.path.relpath(path, memory_dir).replace("\\", "/"))
+    return migrated
+
+
 # ── Emergency dead man's switch ──────────────────────────────────────
 
 def _find_memory_root(memory_dir):
@@ -809,6 +862,20 @@ def rebalance(memory_dir, max_lines=DEFAULT_MAX_LINES,
 
     if not os.path.exists(memory_md):
         return ["MEMORY.md not found — nothing to do."], [], []
+
+    # One-time heal: rewrite any logical pointer written with Windows
+    # backslashes by a pre-fix run into POSIX form, before anything parses
+    # or classifies the tree. Idempotent; touches only files with a
+    # backslash in a link target.
+    if not dry_run:
+        migrated = migrate_separators(memory_dir)
+        if migrated:
+            shown = ", ".join(migrated[:10])
+            more = (f" (+{len(migrated) - 10} more)"
+                    if len(migrated) > 10 else "")
+            actions.append(
+                f"Migrated {len(migrated)} index file(s) to POSIX "
+                f"pointer separators: {shown}{more}")
 
     header, entries = parse_index(memory_md)
 
