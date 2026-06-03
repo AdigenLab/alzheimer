@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import platform
+import posixpath
 import re
 import subprocess
 import sys
@@ -295,7 +296,10 @@ def exceeds_limits(filepath, header, entries, max_lines, max_bytes):
 
 def is_category_entry(entry):
     """Check if an entry points to an index file (at any depth)."""
-    path = entry["path"]
+    # Normalize separators: a link may have been written with a backslash
+    # by an older Windows run (os.path.join), but logical paths compare in
+    # POSIX form.
+    path = entry["path"].replace("\\", "/")
     # Entries starting with "../" are leaves pointing to the parent dir.
     if path.startswith("../"):
         return False
@@ -306,8 +310,8 @@ def is_category_entry(entry):
 def is_sub_index_pointer(entry):
     """Check if an entry points to a sub-index (within a category dir)."""
     # Sub-index pointers look like "feedback/broken.md" (relative to
-    # the parent index in _index/).
-    path = entry["path"]
+    # the parent index in _index/). Normalize separators for Windows.
+    path = entry["path"].replace("\\", "/")
     return "/" in path and not path.startswith("../")
 
 
@@ -352,8 +356,11 @@ def build_category_index(memory_dir, category, entries):
     index_dir = os.path.join(memory_dir, INDEX_DIR)
     os.makedirs(index_dir, exist_ok=True)
 
-    index_path = os.path.join(INDEX_DIR, f"{category}.md")
-    full_index_path = os.path.join(memory_dir, index_path)
+    # Logical link path stays POSIX: it goes into a Markdown link and into
+    # string-based category checks (is_category_entry). os.path.join would
+    # emit a backslash on Windows that those checks then fail to match.
+    index_path = f"{INDEX_DIR}/{category}.md"
+    full_index_path = os.path.join(memory_dir, INDEX_DIR, f"{category}.md")
 
     # If the index already exists, merge entries (don't duplicate).
     existing_paths = set()
@@ -1521,8 +1528,12 @@ def resolve_child_path(parent_rel_path, child_entry_path):
     child_entry_path: e.g. "feedback/broken.md" (relative to parent)
     Returns: e.g. "_index/feedback/broken.md" (relative to memory_dir)
     """
-    parent_dir = os.path.dirname(parent_rel_path)
-    return os.path.normpath(os.path.join(parent_dir, child_entry_path))
+    # Keep the result POSIX: os.path.normpath would emit backslashes on
+    # Windows, but this path round-trips through Markdown links and string
+    # path checks that compare against "/".
+    parent_dir = posixpath.dirname(parent_rel_path.replace("\\", "/"))
+    child = child_entry_path.replace("\\", "/")
+    return posixpath.normpath(posixpath.join(parent_dir, child))
 
 
 def _gc_orphan_subindices(memory_dir, parent_rel_path, entries, dry_run):

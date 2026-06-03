@@ -43,6 +43,7 @@ from rebalance import (
     UPDATE_CHECK_INTERVAL,
     _read_update_cache,
     _write_update_cache,
+    build_category_index,
     build_glossary_entry,
     build_guardrails_entry,
     bootstrap_text,
@@ -63,6 +64,7 @@ from rebalance import (
     guardrails_system_message,
     group_entries_by_keyword,
     is_category_entry,
+    is_sub_index_pointer,
     load_config,
     parse_glossary,
     parse_guardrails,
@@ -70,6 +72,7 @@ from rebalance import (
     read_all_frontmatter,
     read_frontmatter_type,
     rebalance,
+    resolve_child_path,
     summarize_entries,
     update_glossary,
     update_guardrails,
@@ -2570,6 +2573,52 @@ class TestBootstrapDirective(unittest.TestCase):
             # No _index/ → directive would point at nothing; header untouched.
             header = ["# Memory Index", ""]
             self.assertEqual(ensure_memory_bootstrap(list(header), d), header)
+
+
+class TestPathSeparators(unittest.TestCase):
+    """Logical index/link paths must be POSIX on every OS.
+
+    os.path.join / os.path.normpath emit backslashes on Windows, but those
+    paths go into Markdown links and string-based category checks that
+    compare against "/". Mixing separators makes rebalance create category
+    pointers it then fails to recognize, breaking grouping/split/recovery.
+    """
+
+    def test_build_category_index_returns_posix_path(self):
+        with TestDir() as d:
+            entries = [
+                {"title": f"F{i}", "path": f"f{i}.md",
+                 "desc": "d", "raw": f"- [F{i}](f{i}.md) - d"}
+                for i in range(3)
+            ]
+            index_path = build_category_index(d, "feedback", entries)
+            self.assertEqual(index_path, "_index/feedback.md")
+            self.assertNotIn("\\", index_path)
+            # The file is created via the OS path regardless of separator.
+            self.assertTrue(os.path.exists(
+                os.path.join(d, "_index", "feedback.md")))
+
+    def test_resolve_child_path_returns_posix(self):
+        out = resolve_child_path("_index/feedback.md", "feedback/broken.md")
+        self.assertEqual(out, "_index/feedback/broken.md")
+        # Tolerant of a backslash-laden parent from an older Windows run.
+        out2 = resolve_child_path("_index\\feedback.md", "feedback\\broken.md")
+        self.assertEqual(out2, "_index/feedback/broken.md")
+
+    def test_category_check_accepts_both_separators(self):
+        for p in ("_index/feedback.md", "_index\\feedback.md"):
+            self.assertTrue(is_category_entry({"path": p}),
+                            f"category not recognized: {p!r}")
+
+    def test_sub_index_check_accepts_both_separators(self):
+        for p in ("feedback/broken.md", "feedback\\broken.md"):
+            self.assertTrue(is_sub_index_pointer({"path": p}),
+                            f"sub-index not recognized: {p!r}")
+
+    def test_leaf_not_mistaken_for_category(self):
+        # A leaf pointing up (../) is never a category, with either separator.
+        for p in ("../foo.md", "..\\foo.md"):
+            self.assertFalse(is_category_entry({"path": p}))
 
 
 if __name__ == "__main__":
