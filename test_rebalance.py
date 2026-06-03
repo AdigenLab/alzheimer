@@ -4,9 +4,25 @@
 import json
 import os
 import shutil
+import sys
 import tempfile
 import time
 import unittest
+
+# UTF-8 file I/O shim (mirrors the one in rebalance.py). The test helpers
+# below open temp files without an explicit encoding; on non-UTF-8 OS
+# locales (e.g. Windows cp1251/cp1252) the platform codec is used, so
+# non-ASCII content (em-dashes, Cyrillic) is written in a codec that
+# rebalance.py's UTF-8 reads then choke on. Default text-mode open() to
+# UTF-8 so the suite behaves identically on every platform.
+import builtins as _builtins
+_std_open = _builtins.open
+def open(*args, **kwargs):  # noqa: A001 — intentional builtins.open override (text mode only)
+    _mode = kwargs.get("mode", args[1] if len(args) > 1 else "r")
+    if "b" not in _mode:
+        kwargs.setdefault("encoding", "utf-8")
+    return _std_open(*args, **kwargs)
+
 
 from rebalance import (
     Anomaly,
@@ -1314,13 +1330,13 @@ class TestHookCLIOutput(unittest.TestCase):
         import json
         import subprocess
         cmd = [
-            "python3", os.path.join(os.path.dirname(__file__), "rebalance.py"),
+            sys.executable, os.path.join(os.path.dirname(__file__), "rebalance.py"),
             "--hook",
         ]
         if extra_args:
             cmd.extend(extra_args)
         cmd.append(d)
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
         lines = [l for l in result.stdout.strip().splitlines() if l.strip()]
         return lines, result
 
@@ -1572,8 +1588,8 @@ class TestCheckAlias(unittest.TestCase):
             make_leaf(d, "a.md", "user", "A")
             make_index(d, [("A", "a.md", "desc")])
             result = subprocess.run(
-                ["python3", "rebalance.py", d, "--check"],
-                capture_output=True, text=True,
+                [sys.executable, "rebalance.py", d, "--check"],
+                capture_output=True, text=True, encoding="utf-8",
                 cwd=os.path.dirname(os.path.abspath(__file__))
             )
             self.assertEqual(result.returncode, 0)
@@ -2172,8 +2188,8 @@ class TestGuardrailsConfigManipulation(unittest.TestCase):
         import subprocess
         gpy = os.path.join(os.path.dirname(__file__), "guardrails.py")
         result = subprocess.run(
-            ["python3", gpy, "--exec", "echo", "hello", "world"],
-            capture_output=True, text=True,
+            [sys.executable, gpy, "--exec", "echo", "hello", "world"],
+            capture_output=True, text=True, encoding="utf-8",
         )
         self.assertEqual(result.returncode, 0)
         self.assertIn("hello world", result.stdout)
