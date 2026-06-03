@@ -307,10 +307,14 @@ def find_install_dir(settings_path):
             for group in groups:
                 for hook in group.get("hooks", []):
                     cmd = hook.get("command", "")
-                    # Look for python3 "/.../rebalance.py" or
-                    # python3 /.../rebalance.py in the command.
-                    m = re.search(r'python3\s+"?([^"]+/rebalance\.py)"?',
-                                  cmd)
+                    # Extract the path to rebalance.py independent of the
+                    # interpreter name (python3 / python.exe / an absolute
+                    # sys.executable) and the path separator (POSIX "/" or
+                    # Windows "\\"). The command is one of:
+                    #   "<interpreter>" "<path>" --hook ...  (quoted; Windows)
+                    #   python3 <path> --hook ...            (unquoted; POSIX)
+                    m = (re.search(r'"([^"]*rebalance\.py)"', cmd)
+                         or re.search(r'(\S*rebalance\.py)', cmd))
                     if m:
                         rpath = m.group(1)
                         if os.path.exists(rpath):
@@ -524,7 +528,8 @@ def do_update(settings_path):
     print("Pulling latest changes...")
     result = subprocess.run(
         ["git", "pull"], cwd=alzheimer_dir,
-        capture_output=True, text=True
+        capture_output=True, text=True,
+        encoding="utf-8", errors="replace"
     )
     if result.returncode != 0:
         print(f"git pull failed: {result.stderr.strip()}")

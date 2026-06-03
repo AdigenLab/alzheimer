@@ -36,8 +36,12 @@ def open(*args, **kwargs):  # noqa: A001 — intentional builtins.open override 
         kwargs.setdefault("encoding", "utf-8")
     return _std_open(*args, **kwargs)
 
-# Ensure stdout/stderr can emit non-ASCII (→, —, box-drawing, memory content) on cp1251 consoles.
-for _stream in (sys.stdout, sys.stderr):
+# Ensure stdin can be READ and stdout/stderr can emit non-ASCII (→, —,
+# box-drawing, memory content) on non-UTF-8 consoles (e.g. Windows cp1251).
+# The PostToolUse payload arrives as UTF-8 JSON on stdin; without
+# reconfiguring stdin the locale codec mis-decodes a non-ASCII file path and
+# the per-write rebalance is silently skipped.
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8")
     except Exception:

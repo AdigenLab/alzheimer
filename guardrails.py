@@ -39,8 +39,13 @@ def open(*args, **kwargs):  # noqa: A001 — intentional builtins.open override 
         kwargs.setdefault("encoding", "utf-8")
     return _std_open(*args, **kwargs)
 
-# Ensure stdout/stderr can emit non-ASCII on cp1251 consoles.
-for _stream in (sys.stdout, sys.stderr):
+# Ensure stdin can be READ and stdout/stderr can emit non-ASCII on
+# non-UTF-8 consoles (e.g. Windows cp1251/cp1252). The PreToolUse payload
+# arrives as UTF-8 JSON on stdin; without reconfiguring stdin the locale
+# codec mis-decodes a non-ASCII command and json.load raises
+# UnicodeDecodeError (a ValueError subclass) — which main_hook's fail-open
+# except would catch, silently allowing a command the guardrail should block.
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8")
     except Exception:
@@ -350,7 +355,8 @@ def exec_with_temporary_allow(command, rule):
     removed = remove_rule(rule)
     try:
         result = subprocess.run(
-            command, shell=True, capture_output=True, text=True
+            command, shell=True, capture_output=True, text=True,
+            encoding="utf-8", errors="replace"
         )
         return result.returncode, result.stdout, result.stderr
     finally:
@@ -431,7 +437,8 @@ def main_exec(command):
     if rule is None:
         # No confirm rule matches — just run it directly.
         result = subprocess.run(
-            command, shell=True, capture_output=True, text=True
+            command, shell=True, capture_output=True, text=True,
+            encoding="utf-8", errors="replace"
         )
         if result.stdout:
             print(result.stdout, end="")

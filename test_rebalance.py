@@ -2621,5 +2621,139 @@ class TestPathSeparators(unittest.TestCase):
             self.assertFalse(is_category_entry({"path": p}))
 
 
+class TestCrossPlatformHardening(unittest.TestCase):
+    """Regression tests for Windows / non-UTF-8-locale defects the rest of
+    the suite does not exercise (it hard-codes encoding='utf-8' at its own
+    call sites and never feeds a locale-decoded stdin)."""
+
+    def setUp(self):
+        # Isolate .guardrails.conf so the --exec test's rule re-add can't
+        # touch the real install config.
+        self.tmpdir = tempfile.mkdtemp()
+        self._orig_dir = guardrails._alzheimer_dir
+        guardrails._alzheimer_dir = lambda: self.tmpdir
+
+    def tearDown(self):
+        guardrails._alzheimer_dir = self._orig_dir
+        shutil.rmtree(self.tmpdir)
+
+    def _gpy(self):
+        return os.path.join(os.path.dirname(__file__), "guardrails.py")
+
+    def _rpy(self):
+        return os.path.join(os.path.dirname(__file__), "rebalance.py")
+
+    def _ascii_stdio_env(self):
+        # Force the child's default stdio codec to ASCII so that, WITHOUT the
+        # import-time sys.stdin reconfigure, a UTF-8 payload would fail to
+        # decode. PYTHONUTF8 would override this, so strip it.
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "ascii"
+        env.pop("PYTHONUTF8", None)
+        env.pop("PYTHONLEGACYWINDOWSSTDIO", None)
+        return env
+
+    # ── setup.find_install_dir: interpreter/separator agnostic (--find) ──
+
+    def test_find_install_dir_windows_command(self):
+        """Locates an install whose hook command uses an absolute python.exe
+        and a backslash path (the Windows form generate_hooks() writes)."""
+        import setup
+        rpath = self._rpy()
+        win_cmd = (f'"C:\\Python314\\python.exe" "{rpath}" '
+                   f'--hook --hook-event PostToolUse')
+        with TestDir() as d:
+            sp = os.path.join(d, "settings.json")
+            with open(sp, "w") as f:
+                json.dump({"hooks": {"PostToolUse": [
+                    {"matcher": "Write|Edit", "hooks": [
+                        {"type": "command", "command": win_cmd}]}]}}, f)
+            found = setup.find_install_dir(sp)
+        self.assertEqual(found, os.path.dirname(rpath))
+
+    def test_find_install_dir_posix_command(self):
+        """The POSIX form (python3 + forward-slash, unquoted) still resolves."""
+        import setup
+        rpath = self._rpy()
+        posix_path = rpath.replace("\\", "/")
+        posix_cmd = f'python3 {posix_path} --hook --hook-event SessionStart'
+        with TestDir() as d:
+            sp = os.path.join(d, "settings.json")
+            with open(sp, "w") as f:
+                json.dump({"hooks": {"SessionStart": [
+                    {"hooks": [{"type": "command",
+                                "command": posix_cmd}]}]}}, f)
+            found = setup.find_install_dir(sp)
+        self.assertEqual(found, os.path.dirname(posix_path))
+
+    # ── guardrails: stdin decoded as UTF-8, no silent fail-open ──
+
+    def test_guardrails_stdin_utf8_does_not_fail_open(self):
+        """A blockable command containing non-ASCII is still caught even when
+        the child's default stdio codec is ASCII. Without the stdin
+        reconfigure, json.load(sys.stdin) raises UnicodeDecodeError, which the
+        fail-open except swallows (exit 0, empty stdout) — a guardrail bypass."""
+        import subprocess
+        payload = json.dumps(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "git push origin фича"}},
+            ensure_ascii=False).encode("utf-8")
+        result = subprocess.run(
+            [sys.executable, self._gpy()], input=payload,
+            capture_output=True, env=self._ascii_stdio_env())
+        out = result.stdout.decode("utf-8", "replace")
+        self.assertIn("permissionDecision", out)
+        self.assertIn("deny", out)
+
+    # ── rebalance: PostToolUse stdin decoded as UTF-8 ──
+
+    def test_rebalance_poststdin_utf8_parses_memory_dir(self):
+        """The PostToolUse hook derives the memory dir from a UTF-8 file path
+        on stdin even under an ASCII default stdio codec; the rebalance then
+        runs (emits its status line) instead of being silently skipped."""
+        import subprocess
+        with TestDir() as d:
+            mem = os.path.join(d, "memory")
+            os.makedirs(mem)
+            with open(os.path.join(mem, "MEMORY.md"), "w") as f:
+                f.write("# Memory\n\n- [X](x.md) — note\n")
+            with open(os.path.join(mem, "EMERGENCY.md"), "w") as f:
+                f.write("<!-- OK -->\n")
+            with open(os.path.join(mem, "x.md"), "w") as f:
+                f.write("---\nname: X\ndescription: n\n"
+                        "type: project\n---\n\nbody\n")
+            # Non-ASCII (Cyrillic) leaf file name in the written path.
+            fp = os.path.join(mem, "привет.md").replace("\\", "/")
+            payload = json.dumps(
+                {"tool_input": {"file_path": fp}},
+                ensure_ascii=False).encode("utf-8")
+            result = subprocess.run(
+                [sys.executable, self._rpy(),
+                 "--hook", "--hook-event", "PostToolUse"],
+                input=payload, capture_output=True,
+                env=self._ascii_stdio_env())
+            out = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("alzheimer", out)
+
+    # ── guardrails --exec: subprocess output decoded as UTF-8 ──
+
+    def test_exec_decodes_subprocess_output_as_utf8(self):
+        """exec_with_temporary_allow decodes a child's UTF-8 stdout as UTF-8
+        regardless of the OS locale (text=True alone uses cp1251 on Windows
+        and would mojibake it)."""
+        helper = os.path.join(self.tmpdir, "emit.py")
+        with open(helper, "w") as f:
+            # Write the raw UTF-8 bytes of 'П' (U+041F) straight to the byte
+            # buffer, bypassing the child's own text encoding.
+            f.write("import sys\n"
+                    "sys.stdout.buffer.write(b'\\xd0\\x9f')\n")
+        rule = {"tool": "Bash", "pattern": r"emit\.py", "action": "confirm"}
+        rc, stdout, stderr = exec_with_temporary_allow(
+            f'"{sys.executable}" "{helper}"', rule)
+        self.assertEqual(rc, 0)
+        self.assertIn("П", stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
