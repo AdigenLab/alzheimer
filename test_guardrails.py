@@ -62,6 +62,14 @@ class TestRunUsesBash(GuardrailsTestBase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout.strip(), "a && b")
 
+    def test_preferred_bash_avoids_wsl_launcher_on_windows(self):
+        # On Windows the Bash tool is git-bash (/c/… → C:), NOT the System32 WSL
+        # launcher (/mnt/c/…) — picking the latter breaks stored `cd /c/… && …`.
+        bash = guardrails._preferred_bash()
+        if os.name == "nt" and bash and shutil.which("git"):
+            self.assertNotIn("system32", bash.lower())
+            self.assertIn("bash", os.path.basename(bash).lower())
+
 
 class TestPendingLifecycle(GuardrailsTestBase):
     def _rule(self):

@@ -27,6 +27,7 @@ deterministic Python code, not a behavioral promise subject to drift.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -398,28 +399,52 @@ def add_rule(rule):
     _save_config(config)
 
 
+def _preferred_bash():
+    """Locate the SAME bash Claude's Bash tool uses — not just the first on PATH.
+
+    On Windows that is Git-for-Windows bash (where `/c/…` maps to C:), derived from
+    git's install dir. `shutil.which("bash")` there returns System32\\bash.exe (the
+    WSL launcher), whose `/mnt/c/…` mapping differs — so a stored `cd /c/… && …`
+    command (written by the git-bash Bash tool) fails with "No such file or
+    directory". On Unix the plain bash on PATH is already correct.
+    """
+    if os.name == "nt":
+        git = shutil.which("git")
+        if git:
+            root = os.path.dirname(os.path.dirname(os.path.abspath(git)))
+            for cand in (os.path.join(root, "bin", "bash.exe"),
+                         os.path.join(root, "usr", "bin", "bash.exe")):
+                if os.path.isfile(cand):
+                    return cand
+    return shutil.which("bash")
+
+
 def _run(command):
     """Run a shell command the way Claude's Bash tool does — via a login bash —
-    so the approved command sees the same PATH/env/aliases (wsl, ssh aliases…).
+    so the approved command sees the same PATH/env/aliases (wsl, ssh aliases…) and
+    path mapping (`/c/…`).
 
     Critically this avoids cmd.exe on Windows: `subprocess.run(cmd, shell=True)`
     there uses cmd.exe, which ignores single quotes and SPLITS on `&&` — mangling
     `wsl -- bash -lc 'cd … && git push …'` into two broken commands. A login bash
-    honours the quoting on every platform (git-bash on Windows). Falls back to the
-    old shell=True only if bash is unavailable.
+    honours the quoting; _preferred_bash() makes sure it's the right bash (git-bash
+    on Windows, not WSL bash). Falls back to shell=True only if no bash is found.
 
     Returns a CompletedProcess.
     """
-    try:
-        return subprocess.run(
-            ["bash", "-lc", command], capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-        )
-    except FileNotFoundError:
-        return subprocess.run(
-            command, shell=True, capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-        )
+    bash = _preferred_bash()
+    if bash:
+        try:
+            return subprocess.run(
+                [bash, "-lc", command], capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+            )
+        except (FileNotFoundError, OSError):
+            pass
+    return subprocess.run(
+        command, shell=True, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
 
 
 def exec_with_temporary_allow(command, rule):
