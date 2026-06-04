@@ -2739,19 +2739,15 @@ class TestCrossPlatformHardening(unittest.TestCase):
 
     # ── guardrails --exec: subprocess output decoded as UTF-8 ──
 
+    @unittest.skipUnless(shutil.which("bash"), "bash not on PATH")
     def test_exec_decodes_subprocess_output_as_utf8(self):
         """exec_with_temporary_allow decodes a child's UTF-8 stdout as UTF-8
         regardless of the OS locale (text=True alone uses cp1251 on Windows
-        and would mojibake it)."""
-        helper = os.path.join(self.tmpdir, "emit.py")
-        with open(helper, "w") as f:
-            # Write the raw UTF-8 bytes of 'П' (U+041F) straight to the byte
-            # buffer, bypassing the child's own text encoding.
-            f.write("import sys\n"
-                    "sys.stdout.buffer.write(b'\\xd0\\x9f')\n")
-        rule = {"tool": "Bash", "pattern": r"emit\.py", "action": "confirm"}
-        rc, stdout, stderr = exec_with_temporary_allow(
-            f'"{sys.executable}" "{helper}"', rule)
+        and would mojibake it). Runs through the login-bash _run() (the shell
+        the Bash tool itself uses); printf emits the raw UTF-8 bytes of 'П'
+        (U+041F = 0xD0 0x9F)."""
+        rule = {"tool": "Bash", "pattern": r"printf", "action": "confirm"}
+        rc, stdout, stderr = exec_with_temporary_allow(r"printf '\xd0\x9f'", rule)
         self.assertEqual(rc, 0)
         self.assertIn("П", stdout)
 

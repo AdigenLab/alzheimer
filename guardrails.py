@@ -29,6 +29,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 # --- UTF-8 file I/O shim — fix for UnicodeDecodeError on non-UTF-8 OS locales (e.g. Windows cp1251) ---
 import builtins as _builtins
@@ -153,6 +154,14 @@ DEFAULT_RULES = [
 # Config file for custom rules (loaded from alzheimer install dir).
 CONFIG_FILE = ".guardrails.conf"
 
+# Pending-approval state. When the hook blocks a "confirm" command, it records
+# that EXACT command here so `--approve` can re-run it verbatim — no re-typing,
+# no re-quoting, no Windows->WSL quoting hell. One-shot (consumed on approve) and
+# TTL-bounded (a stale pending is refused, so an old/forgotten command can't be
+# replayed). Path overridable via $ALZ_PENDING_FILE (tests).
+PENDING_FILE = ".guardrails.pending"
+PENDING_TTL = 300  # seconds; pending older than this is stale and refused
+
 
 # ── Rule loading ──────────────────────────────────────────────────────
 
@@ -218,7 +227,12 @@ def get_match_text(tool_name, tool_input):
 
 
 def _is_self_exec(tool_name, tool_input):
-    """Check if this is a guardrails.py --exec invocation (self-allowlist)."""
+    """Check if this is a guardrails.py --exec / --approve invocation (self-allowlist).
+
+    The PreToolUse hook fires on EVERY Bash call, including our own bypass
+    invocations. Without this allowlist the bypass would be blocked by the very
+    guard it is trying to lift, so it must recognize both --exec and --approve.
+    """
     if tool_name != "Bash":
         return False
     command = tool_input.get("command", "").strip()
@@ -227,11 +241,11 @@ def _is_self_exec(tool_name, tool_input):
     command = re.sub(r'^cd\s+\S+\s*&&\s*', '', command).strip()
     # Match both direct and python-prefixed invocations:
     #   python3 "/path/to/guardrails.py" --exec "..."
-    #   ~/.alzheimer/guardrails.py --exec "..."
-    #   /home/user/.alzheimer/guardrails.py --exec "..."
+    #   python3 "/path/to/guardrails.py" --approve [--dry-run]
+    #   ~/.alzheimer/guardrails.py --approve
     # Anchored to start of command to prevent matching embedded strings.
     return bool(re.match(
-        r'["\']?(?:python3?\s+["\']?)?[^\s"\']*guardrails\.py["\']?\s+--exec\b',
+        r'["\']?(?:python3?\s+["\']?)?[^\s"\']*guardrails\.py["\']?\s+--(?:exec|approve)\b',
         command
     ))
 
@@ -295,6 +309,43 @@ def _config_path():
     return os.path.join(_alzheimer_dir(), CONFIG_FILE)
 
 
+# ── Pending-approval state (one-shot bypass of the last blocked command) ──────
+
+def _pending_path():
+    """Return path to .guardrails.pending ($ALZ_PENDING_FILE overrides for tests)."""
+    return os.environ.get("ALZ_PENDING_FILE") or os.path.join(_alzheimer_dir(), PENDING_FILE)
+
+
+def arm_pending(command, rule):
+    """Record the blocked command so --approve can re-run it verbatim. Best-effort."""
+    try:
+        with open(_pending_path(), "w") as f:
+            json.dump({"command": command, "rule": rule, "ts": time.time()}, f)
+        return True
+    except OSError:
+        return False
+
+
+def read_pending():
+    """Return the pending dict, or None if absent/unreadable."""
+    path = _pending_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def clear_pending():
+    """Remove the pending file (one-shot consume). Best-effort."""
+    try:
+        os.remove(_pending_path())
+    except OSError:
+        pass
+
+
 def _load_config():
     """Load config file, returning (config_dict, existed)."""
     path = _config_path()
@@ -347,6 +398,30 @@ def add_rule(rule):
     _save_config(config)
 
 
+def _run(command):
+    """Run a shell command the way Claude's Bash tool does — via a login bash —
+    so the approved command sees the same PATH/env/aliases (wsl, ssh aliases…).
+
+    Critically this avoids cmd.exe on Windows: `subprocess.run(cmd, shell=True)`
+    there uses cmd.exe, which ignores single quotes and SPLITS on `&&` — mangling
+    `wsl -- bash -lc 'cd … && git push …'` into two broken commands. A login bash
+    honours the quoting on every platform (git-bash on Windows). Falls back to the
+    old shell=True only if bash is unavailable.
+
+    Returns a CompletedProcess.
+    """
+    try:
+        return subprocess.run(
+            ["bash", "-lc", command], capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+    except FileNotFoundError:
+        return subprocess.run(
+            command, shell=True, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+
+
 def exec_with_temporary_allow(command, rule):
     """Remove rule, run command, re-add rule. Guaranteed by try/finally.
 
@@ -354,10 +429,7 @@ def exec_with_temporary_allow(command, rule):
     """
     removed = remove_rule(rule)
     try:
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True,
-            encoding="utf-8", errors="replace"
-        )
+        result = _run(command)
         return result.returncode, result.stdout, result.stderr
     finally:
         if removed:
@@ -389,9 +461,12 @@ def find_matching_rule(command):
 # ── Main ──────────────────────────────────────────────────────────────
 
 def main():
-    """Entry point. Dispatches to hook mode or --exec mode."""
-    if len(sys.argv) >= 3 and sys.argv[1] == "--exec":
+    """Entry point. Dispatches to hook / --exec / --approve mode."""
+    args = sys.argv[1:]
+    if args and args[0] == "--exec" and len(sys.argv) >= 3:
         main_exec(" ".join(sys.argv[2:]))
+    elif args and args[0] == "--approve":
+        main_approve(dry_run="--dry-run" in args)
     else:
         main_hook()
 
@@ -412,6 +487,19 @@ def main_hook():
     if allowed:
         sys.exit(0)
     else:
+        # If a CONFIRM rule matched (not a hard block), arm the pending state so
+        # the human-approved command can be re-run verbatim via --approve, and
+        # surface that ready-to-copy command in the deny reason.
+        if tool_name == "Bash":
+            command = tool_input.get("command", "")
+            rule = find_matching_rule(command)  # only returns confirm rules
+            if rule is not None and arm_pending(command, rule):
+                approve_cmd = f'python3 "{os.path.abspath(__file__)}" --approve'
+                message += (
+                    f" Or, after the user approves, run: {approve_cmd} "
+                    f"— re-runs THIS exact command once (within {PENDING_TTL // 60} min); "
+                    f"add --dry-run to preview first."
+                )
         # Block the tool call using both mechanisms for maximum reliability:
         # 1. Structured deny JSON on stdout (canonical protocol per #37210).
         # Exit 0 so Claude Code parses stdout. Exit 2 causes stdout to be
@@ -436,10 +524,7 @@ def main_exec(command):
     rule = find_matching_rule(command)
     if rule is None:
         # No confirm rule matches — just run it directly.
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True,
-            encoding="utf-8", errors="replace"
-        )
+        result = _run(command)
         if result.stdout:
             print(result.stdout, end="")
         if result.stderr:
@@ -447,6 +532,66 @@ def main_exec(command):
         sys.exit(result.returncode)
 
     returncode, stdout, stderr = exec_with_temporary_allow(command, rule)
+    if stdout:
+        print(stdout, end="")
+    if stderr:
+        print(stderr, end="", file=sys.stderr)
+    sys.exit(returncode)
+
+
+def main_approve(dry_run=False):
+    """Re-run the most-recently-blocked confirm command, verbatim, one-shot.
+
+    The hook stored the exact command (no re-typing/re-quoting needed). We verify
+    it is fresh (TTL), then either preview it (--dry-run) or run it through the
+    temporary-rule-lift wrapper and consume the pending state. This is the
+    convenient, low-error path to clear a confirm guard after the user approves.
+    """
+    pending = read_pending()
+    if pending is None:
+        print(
+            "Nothing pending to approve — no command was recently blocked "
+            "(or the pending state was already consumed).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    command = pending.get("command", "")
+    rule = pending.get("rule")
+    age = time.time() - float(pending.get("ts", 0) or 0)
+
+    if not command:
+        clear_pending()
+        print("Pending command was empty; cleared.", file=sys.stderr)
+        sys.exit(1)
+
+    if age > PENDING_TTL:
+        clear_pending()
+        print(
+            f"Pending command is stale ({int(age)}s old > {PENDING_TTL}s TTL) and "
+            f"was refused. Re-run the original command to re-arm, then --approve.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if dry_run:
+        pattern = rule.get("pattern") if isinstance(rule, dict) else None
+        print(f"[dry-run] Pending ({int(age)}s old) — would run verbatim:")
+        print(f"  {command}")
+        if pattern:
+            print(f"[dry-run] Guard temporarily lifted for rule: {pattern}")
+        print("[dry-run] NOT executed; pending kept. Re-run without --dry-run to execute.")
+        sys.exit(0)
+
+    try:
+        if isinstance(rule, dict):
+            returncode, stdout, stderr = exec_with_temporary_allow(command, rule)
+        else:
+            result = _run(command)
+            returncode, stdout, stderr = result.returncode, result.stdout, result.stderr
+    finally:
+        clear_pending()  # one-shot: consume regardless of outcome
+
     if stdout:
         print(stdout, end="")
     if stderr:

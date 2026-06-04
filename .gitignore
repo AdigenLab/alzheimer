@@ -1,3 +1,5 @@
 __pycache__/
 .alzheimer.lastcheck
 .DS_Store
+.guardrails.conf
+.guardrails.pending
