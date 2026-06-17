@@ -635,6 +635,24 @@ UPDATE_CHECK_INTERVAL = 86400  # 24 hours
 # Cache file storing the last check timestamp and result.
 UPDATE_CACHE_FILE = ".alzheimer.lastcheck"
 
+# Minimum seconds between hook-driven --all-projects sweeps.  A burst of tabs
+# restarting together (e.g. an IDE restoring N Claude panels at once) fires N
+# identical SessionStart hooks within seconds: the first sweep balances every
+# project, the rest repeat the exact same idempotent work and contend on the
+# same MEMORY.md files.  A short throttle collapses the burst to one sweep,
+# while a tab opened minutes later still triggers a fresh sweep as designed.
+# Deliberately short (not the 24h update cadence): the goal is to debounce
+# concurrent starts, not to skip rebalancing.  Override with env
+# ALZHEIMER_ALLPROJECTS_INTERVAL (seconds; 0 or negative disables the throttle).
+ALLPROJECTS_MIN_INTERVAL = 180  # 3 minutes
+
+# Machine-global stamp marking the last sweep.  Lives in ~/.claude (not under
+# projects/*/memory, so the --all-projects glob never picks it up).
+ALLPROJECTS_STAMP_FILE = os.path.join(
+    os.path.expanduser(os.path.join("~", ".claude")),
+    ".alzheimer_allprojects_lastrun",
+)
+
 
 def _alzheimer_dir():
     """Return the directory containing this script (the alzheimer repo)."""
@@ -760,6 +778,102 @@ def check_for_updates(alzheimer_dir=None, force=False):
             f"origin/main. Tell the user and offer to run the update."
         )
     return 0, None
+
+
+# ── --all-projects throttle (debounce concurrent session starts) ──────
+
+def _allprojects_interval():
+    """Throttle window in seconds.  Env ALZHEIMER_ALLPROJECTS_INTERVAL
+    overrides the default; 0 or negative disables the throttle entirely.
+    A malformed value falls back to the default rather than crashing a hook."""
+    raw = os.environ.get("ALZHEIMER_ALLPROJECTS_INTERVAL")
+    if raw is None or raw == "":
+        return ALLPROJECTS_MIN_INTERVAL
+    try:
+        return int(raw)
+    except ValueError:
+        return ALLPROJECTS_MIN_INTERVAL
+
+
+def _claim_allprojects_sweep(stamp_path=None, interval=None, now=None):
+    """Atomically decide whether THIS process should run the --all-projects
+    sweep, debouncing a burst of concurrent SessionStart hooks.
+
+    Returns True for exactly one process per ``interval`` window even when many
+    start within milliseconds of each other (an IDE restoring several panels);
+    every other concurrent process gets False and should skip the sweep.
+
+    Mechanism: a fresh stamp file (mtime within ``interval``) means a recent
+    sweep already covered this window -> skip.  Otherwise processes contend for
+    an exclusive lock (O_CREAT|O_EXCL, atomic on POSIX and Windows); the single
+    winner re-checks the stamp *under* the lock (closing the read-then-act race),
+    refreshes the stamp, releases the lock, and proceeds.  The sweep itself is
+    idempotent, so the vanishingly rare double-run is wasteful, never corrupt.
+
+    Fails open: if the throttle is disabled or the lock can't be taken for an
+    unexpected reason, returns True so rebalancing still happens.
+    """
+    import time
+    if interval is None:
+        interval = _allprojects_interval()
+    if interval <= 0:
+        return True  # throttle disabled
+    if stamp_path is None:
+        stamp_path = ALLPROJECTS_STAMP_FILE
+    if now is None:
+        now = time.time()
+
+    def _fresh(path):
+        try:
+            return (now - os.path.getmtime(path)) < interval
+        except OSError:
+            return False  # missing/unreadable stamp -> not fresh
+
+    # Fast path: a recent sweep already covered this window.
+    if _fresh(stamp_path):
+        return False
+
+    try:
+        os.makedirs(os.path.dirname(stamp_path), exist_ok=True)
+    except OSError:
+        pass
+
+    lock_path = stamp_path + ".lock"
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        # Another process is claiming right now — yield, unless the lock is
+        # stale (a crashed previous run left it behind).
+        try:
+            if (now - os.path.getmtime(lock_path)) > 60:
+                os.remove(lock_path)
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            else:
+                return False
+        except OSError:
+            return False
+    except OSError:
+        return True  # fail open: better a redundant sweep than none
+
+    try:
+        # Double-check under the lock: a racing winner may have refreshed the
+        # stamp between our _fresh() read above and acquiring the lock.
+        if _fresh(stamp_path):
+            return False
+        # Claim the window: refresh the stamp *before* the slow sweep so peers
+        # see it immediately.
+        try:
+            with open(stamp_path, "w") as f:
+                f.write(str(now))
+        except OSError:
+            pass
+        return True
+    finally:
+        os.close(fd)
+        try:
+            os.remove(lock_path)
+        except OSError:
+            pass
 
 
 # ── Drift detection ───────────────────────────────────────────────────
@@ -2240,6 +2354,13 @@ def main():
 
     # --all-projects: run once per project memory dir (Python glob; no bash needed).
     if args.all_projects:
+        # Debounce bursts of concurrent SessionStart hooks (e.g. an IDE
+        # restoring several Claude panels at once): only the first process in a
+        # short window actually sweeps; the rest would repeat identical,
+        # idempotent work and contend on the same MEMORY.md files.  Manual runs
+        # (no --hook) are intentional and always sweep.
+        if args.hook and not _claim_allprojects_sweep():
+            sys.exit(0)
         import glob
         _base = os.path.expanduser(os.path.join("~", ".claude", "projects"))
         _dirs = [d for d in glob.glob(os.path.join(_base, "*", "memory"))

@@ -25,6 +25,7 @@ def open(*args, **kwargs):  # noqa: A001 — intentional builtins.open override 
 
 
 from rebalance import (
+    ALLPROJECTS_MIN_INTERVAL,
     Anomaly,
     BOOTSTRAP_END,
     BOOTSTRAP_START,
@@ -41,6 +42,8 @@ from rebalance import (
     MAX_DEPTH,
     UPDATE_CACHE_FILE,
     UPDATE_CHECK_INTERVAL,
+    _allprojects_interval,
+    _claim_allprojects_sweep,
     _read_update_cache,
     _write_update_cache,
     build_category_index,
@@ -2801,6 +2804,73 @@ class TestCrossPlatformHardening(unittest.TestCase):
 
             # Idempotent: nothing left to migrate.
             self.assertEqual(migrate_separators(d), [])
+
+
+class TestAllProjectsThrottle(unittest.TestCase):
+    """Debounce of concurrent --all-projects sweeps (parallel session starts)."""
+
+    def _stamp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        return os.path.join(d, "lastrun")
+
+    def test_first_call_sweeps_and_stamps(self):
+        stamp = self._stamp()
+        self.assertTrue(_claim_allprojects_sweep(stamp, interval=180, now=1000.0))
+        self.assertTrue(os.path.exists(stamp))
+
+    def test_recent_stamp_is_skipped(self):
+        stamp = self._stamp()
+        self.assertTrue(_claim_allprojects_sweep(stamp, interval=180, now=1000.0))
+        # A second start moments later in the same window must skip.
+        self.assertFalse(_claim_allprojects_sweep(stamp, interval=180, now=1010.0))
+
+    def test_stale_stamp_sweeps_again(self):
+        stamp = self._stamp()
+        self.assertTrue(_claim_allprojects_sweep(stamp, interval=180, now=1000.0))
+        # Past the window, a fresh sweep is allowed again (short throttle, not a
+        # long cache — opening a tab minutes later still rebalances).
+        os.utime(stamp, (1000.0, 1000.0))  # pin mtime to the claimed instant
+        self.assertTrue(_claim_allprojects_sweep(stamp, interval=180, now=1200.0))
+
+    def test_zero_interval_disables_throttle(self):
+        stamp = self._stamp()
+        self.assertTrue(_claim_allprojects_sweep(stamp, interval=0, now=1000.0))
+        self.assertTrue(_claim_allprojects_sweep(stamp, interval=0, now=1000.0))
+
+    def test_concurrent_burst_has_exactly_one_winner(self):
+        import threading
+        stamp = self._stamp()
+        n = 16
+        barrier = threading.Barrier(n)
+        results = [None] * n
+
+        def worker(i):
+            barrier.wait()  # maximise contention on the lock
+            results[i] = _claim_allprojects_sweep(stamp, interval=180, now=1000.0)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sum(1 for r in results if r), 1,
+                         "exactly one process must sweep on a concurrent burst")
+
+    def test_env_override_and_default(self):
+        prev = os.environ.pop("ALZHEIMER_ALLPROJECTS_INTERVAL", None)
+        try:
+            self.assertEqual(_allprojects_interval(), ALLPROJECTS_MIN_INTERVAL)
+            os.environ["ALZHEIMER_ALLPROJECTS_INTERVAL"] = "42"
+            self.assertEqual(_allprojects_interval(), 42)
+            os.environ["ALZHEIMER_ALLPROJECTS_INTERVAL"] = "0"
+            self.assertEqual(_allprojects_interval(), 0)
+            os.environ["ALZHEIMER_ALLPROJECTS_INTERVAL"] = "garbage"
+            self.assertEqual(_allprojects_interval(), ALLPROJECTS_MIN_INTERVAL)
+        finally:
+            os.environ.pop("ALZHEIMER_ALLPROJECTS_INTERVAL", None)
+            if prev is not None:
+                os.environ["ALZHEIMER_ALLPROJECTS_INTERVAL"] = prev
 
 
 if __name__ == "__main__":
