@@ -109,6 +109,20 @@ class TestPendingLifecycle(GuardrailsTestBase):
         # One-shot: pending consumed.
         self.assertFalse(os.path.exists(self.pending))
 
+    def test_approve_runs_in_recorded_cwd(self):
+        # A relative-path write must land in the cwd recorded at arm time,
+        # not the process cwd — this is the nested-repo (collector/admin) fix.
+        workdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, workdir, ignore_errors=True)
+        self.assertTrue(
+            guardrails.arm_pending("echo IN_CWD > marker.txt", self._rule(), cwd=workdir)
+        )
+        with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            guardrails.main_approve()
+        self.assertEqual(cm.exception.code, 0)
+        self.assertTrue(os.path.exists(os.path.join(workdir, "marker.txt")))
+        self.assertFalse(os.path.exists(self.pending))  # one-shot consumed
+
     def test_approve_propagates_nonzero_exit(self):
         guardrails.arm_pending("exit 7", self._rule())
         with self.assertRaises(SystemExit) as cm:
@@ -135,8 +149,11 @@ class TestPendingLifecycle(GuardrailsTestBase):
 class TestHookArmsPending(GuardrailsTestBase):
     """Integration: run the script as the PreToolUse hook would."""
 
-    def _hook(self, command):
-        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+    def _hook(self, command, cwd=None):
+        data = {"tool_name": "Bash", "tool_input": {"command": command}}
+        if cwd is not None:
+            data["cwd"] = cwd
+        payload = json.dumps(data)
         env = {**os.environ, "ALZ_PENDING_FILE": self.pending}
         return subprocess.run(
             [sys.executable, guardrails.__file__],
@@ -151,6 +168,13 @@ class TestHookArmsPending(GuardrailsTestBase):
         p = guardrails.read_pending()
         self.assertIsNotNone(p)
         self.assertEqual(p["command"], "git push origin main")
+
+    def test_hook_records_cwd_from_payload(self):
+        r = self._hook("git push origin main", cwd="/some/where")
+        self.assertEqual(r.returncode, 0)
+        p = guardrails.read_pending()
+        self.assertIsNotNone(p)
+        self.assertEqual(p["cwd"], "/some/where")
 
     def test_self_approve_invocation_allowed_by_hook(self):
         r = self._hook('python3 "/x/guardrails.py" --approve')

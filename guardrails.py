@@ -317,11 +317,18 @@ def _pending_path():
     return os.environ.get("ALZ_PENDING_FILE") or os.path.join(_alzheimer_dir(), PENDING_FILE)
 
 
-def arm_pending(command, rule):
-    """Record the blocked command so --approve can re-run it verbatim. Best-effort."""
+def arm_pending(command, rule, cwd=None):
+    """Record the blocked command so --approve can re-run it verbatim. Best-effort.
+
+    `cwd` is the working directory the Bash tool ran the command in (from the
+    PreToolUse payload). It is stored so --approve replays the command in that
+    SAME directory — the approve process starts in the session cwd, which for a
+    nested repo (collector, admin) differs from where the command was issued,
+    so without this the replay would target the wrong repo.
+    """
     try:
         with open(_pending_path(), "w") as f:
-            json.dump({"command": command, "rule": rule, "ts": time.time()}, f)
+            json.dump({"command": command, "rule": rule, "cwd": cwd, "ts": time.time()}, f)
         return True
     except OSError:
         return False
@@ -419,10 +426,15 @@ def _preferred_bash():
     return shutil.which("bash")
 
 
-def _run(command):
+def _run(command, cwd=None):
     """Run a shell command the way Claude's Bash tool does — via a login bash —
     so the approved command sees the same PATH/env/aliases (wsl, ssh aliases…) and
     path mapping (`/c/…`).
+
+    `cwd`, when given, is the directory to run in (the Bash tool's working dir,
+    captured from the hook payload). A separately-spawned approve process does NOT
+    inherit the Bash tool's persistent cwd, so replaying without it targets the
+    session cwd — the wrong repo for nested checkouts. When None, inherit as before.
 
     Critically this avoids cmd.exe on Windows: `subprocess.run(cmd, shell=True)`
     there uses cmd.exe, which ignores single quotes and SPLITS on `&&` — mangling
@@ -432,29 +444,31 @@ def _run(command):
 
     Returns a CompletedProcess.
     """
+    # A cwd that no longer exists would make subprocess.run raise; ignore it then.
+    run_cwd = cwd if (cwd and os.path.isdir(cwd)) else None
     bash = _preferred_bash()
     if bash:
         try:
             return subprocess.run(
                 [bash, "-lc", command], capture_output=True, text=True,
-                encoding="utf-8", errors="replace",
+                encoding="utf-8", errors="replace", cwd=run_cwd,
             )
         except (FileNotFoundError, OSError):
             pass
     return subprocess.run(
         command, shell=True, capture_output=True, text=True,
-        encoding="utf-8", errors="replace",
+        encoding="utf-8", errors="replace", cwd=run_cwd,
     )
 
 
-def exec_with_temporary_allow(command, rule):
+def exec_with_temporary_allow(command, rule, cwd=None):
     """Remove rule, run command, re-add rule. Guaranteed by try/finally.
 
     Returns (returncode, stdout, stderr).
     """
     removed = remove_rule(rule)
     try:
-        result = _run(command)
+        result = _run(command, cwd=cwd)
         return result.returncode, result.stdout, result.stderr
     finally:
         if removed:
@@ -506,6 +520,7 @@ def main_hook():
 
     tool_name = data.get("tool_name", "")
     tool_input = data.get("tool_input", {})
+    hook_cwd = data.get("cwd")  # dir the Bash tool ran in — replay --approve here
 
     allowed, message = check_rules(tool_name, tool_input)
 
@@ -518,7 +533,7 @@ def main_hook():
         if tool_name == "Bash":
             command = tool_input.get("command", "")
             rule = find_matching_rule(command)  # only returns confirm rules
-            if rule is not None and arm_pending(command, rule):
+            if rule is not None and arm_pending(command, rule, cwd=hook_cwd):
                 approve_cmd = f'python3 "{os.path.abspath(__file__)}" --approve'
                 message += (
                     f" Or, after the user approves, run: {approve_cmd} "
@@ -583,6 +598,7 @@ def main_approve(dry_run=False):
 
     command = pending.get("command", "")
     rule = pending.get("rule")
+    cwd = pending.get("cwd")  # replay in the dir the command was issued in
     age = time.time() - float(pending.get("ts", 0) or 0)
 
     if not command:
@@ -603,6 +619,8 @@ def main_approve(dry_run=False):
         pattern = rule.get("pattern") if isinstance(rule, dict) else None
         print(f"[dry-run] Pending ({int(age)}s old) — would run verbatim:")
         print(f"  {command}")
+        if cwd:
+            print(f"[dry-run] In directory: {cwd}")
         if pattern:
             print(f"[dry-run] Guard temporarily lifted for rule: {pattern}")
         print("[dry-run] NOT executed; pending kept. Re-run without --dry-run to execute.")
@@ -610,9 +628,9 @@ def main_approve(dry_run=False):
 
     try:
         if isinstance(rule, dict):
-            returncode, stdout, stderr = exec_with_temporary_allow(command, rule)
+            returncode, stdout, stderr = exec_with_temporary_allow(command, rule, cwd=cwd)
         else:
-            result = _run(command)
+            result = _run(command, cwd=cwd)
             returncode, stdout, stderr = result.returncode, result.stdout, result.stderr
     finally:
         clear_pending()  # one-shot: consume regardless of outcome
